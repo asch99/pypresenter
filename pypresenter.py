@@ -50,6 +50,8 @@ if IS_DARWIN:
             NSBorderlessWindowMask,
             NSNonactivatingPanelMask,
         )
+        # AppKit to get frontmostApplication / reactivate apps
+        from AppKit import NSWorkspace, NSRunningApplication            
     except Exception as e:
         print("Warning: PyObjC not available or failed to import. macOS-specific behavior will not be applied.")
         print("Install with: pip install pyobjc")
@@ -265,6 +267,17 @@ class PresenterOverlay(QWidget):
         emitter.mode_changed.connect(self._on_mode_changed)
 
         # show/hide once to ensure native window created, then hide
+        # set attribute to avoid activating the app when the overlay is shown
+        try:
+            # WA_ShowWithoutActivating prevents the window from stealing focus on macOS
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        except Exception:
+            # older PySide/PyQt names compatibility
+            try:
+                self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            except Exception:
+                pass
+    
         self.show()
         self.hide()
         self.raise_()
@@ -302,11 +315,32 @@ class PresenterOverlay(QWidget):
         geom = self.get_current_screen_geometry()
         self.setGeometry(geom)
 
+        # On macOS, record the current frontmost app so we can restore focus later
+        if IS_DARWIN:
+            try:
+                workspace = NSWorkspace.sharedWorkspace()
+                front = workspace.frontmostApplication()
+                # store a strong reference (NSRunningApplication)
+                self._previous_frontmost_app = front
+            except Exception:
+                self._previous_frontmost_app = None
+
         if not self.overlay_active:
             self.overlay_active = True
+
+            # Ensure we do not activate the app when showing the overlay
+            try:
+                self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            except Exception:
+                try:
+                    self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+                except Exception:
+                    pass
+
+            # show without stealing focus
             self.show()
             self.raise_()
-            
+
             # decide timer usage
             if self.is_laser_mode:
                 # laser needs frequent updates for trail
@@ -326,6 +360,32 @@ class PresenterOverlay(QWidget):
             self.timer.stop()
             self.laser_trail.clear()
             self.hide()
+
+            # On macOS try to restore the previously frontmost app (if any)
+            if IS_DARWIN and getattr(self, "_previous_frontmost_app", None) is not None:
+                try:
+                    # Reactivate the previous frontmost application.
+                    # Use a slight delay to avoid racing with window hide.
+                    def _reactivate():
+                        try:
+                            self._previous_frontmost_app.activateWithOptions_(0)
+                        except Exception:
+                            # fallback: try to activate by PID (best-effort)
+                            try:
+                                pid = int(self._previous_frontmost_app.processIdentifier())
+                                app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+                                if app is not None:
+                                    app.activateWithOptions_(0)
+                            except Exception:
+                                pass
+                        finally:
+                            # clear stored reference
+                            self._previous_frontmost_app = None
+
+                    QTimer.singleShot(30, _reactivate)
+                except Exception:
+                    # In case of any issue, just clear reference
+                    self._previous_frontmost_app = None
 
     # -----------------
     # timer tick: either advance laser or poll cursor for spotlight
