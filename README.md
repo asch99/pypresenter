@@ -24,9 +24,8 @@ Fine for macos, but can create a spotlight ghost in specific situations (but alw
 
 **Known Issues**
 * Pressing a button on the presenter is also passed to the application active on the screen. To make it work would require systemlevel changes that break the simplistic approach of this tool.
- * On MacOS it is possible to create a ghost of the first drawn spotlight. So far I cannot completely fix that, but as it is always removed when switching the spotlight off and on, it is acceptable for now
- * On MacOS pypresenter needs permission for "Input event monitoring". This must be set manually in Settings->Privacy & Security->Input Monitoring. If pypresenter is started from the command line, the Terminal will need that permission.
- * On MacOS when pypresenter is installed from the provide zip package, it will probably complain that the app is damaged because it is not a commercially signed package. To fix it, either manually clear the warning from the command line, or run the python version.
+* On MacOS pypresenter needs permission for "Input event monitoring". This must be set manually in Settings->Privacy & Security->Input Monitoring. If pypresenter is started from the command line, the Terminal will need that permission.
+* On MacOS when pypresenter is installed from the provide zip package, it will probably complain that the app is damaged because it is not a commercially signed package. To fix it, either manually clear the warning from the command line, or run the python version.
  
 
 ## Requirements

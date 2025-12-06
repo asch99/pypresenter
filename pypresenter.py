@@ -22,7 +22,7 @@ requirements:
 and additionally on macos:
  objc 
 """
-__version__ = "20251205"
+__version__ = "20251206"
 
 import sys
 import threading
@@ -51,7 +51,7 @@ if IS_DARWIN:
             NSNonactivatingPanelMask,
         )
         # AppKit to get frontmostApplication / reactivate apps
-        from AppKit import NSWorkspace, NSRunningApplication            
+        from AppKit import NSWorkspace, NSRunningApplication          
     except Exception as e:
         print("Warning: PyObjC not available or failed to import. macOS-specific behavior will not be applied.")
         print("Install with: pip install pyobjc")
@@ -69,17 +69,16 @@ class Config:
 
     def __init__(self):
         # default settings. values in config override these
-        self.MODES = ["SPOTLIGHT_HOLD", "LASER", "SPOTLIGHT_TOGGLE"]
         self.MODES = ["SPOTLIGHT_HOLD", "LASER"]
-        self.SPOT_RADIUS = 150.0
-        self.BACKGROUND_ALPHA = 220
+        self.SPOT_RADIUS = 200.0
+        self.BACKGROUND_ALPHA = 155
         self.SPOT_RING_THICKNESS = 0.05
         self.SPOT_RING_COLOR_R = 255
         self.SPOT_RING_COLOR_G = 105
         self.SPOT_RING_COLOR_B = 180
         self.SPOT_RING_COLOR_A = 255
         self.LASER_MAX_TRAIL_LENGTH = 15
-        self.LASER_BASE_RADIUS = 7.0
+        self.LASER_BASE_RADIUS = 12.0
         self.LASER_HEAD_MULTIPLIER = 1.5
         self.LASER_COLOR_R = 255
         self.LASER_COLOR_G = 0
@@ -177,10 +176,10 @@ class Config:
         self.hole_radius = float(self.SPOT_RADIUS)*(hole_fraction+blur_width)
 
         pink_grad = QRadialGradient(QPointF(0,0), self.SPOT_RADIUS, QPointF(0,0))
-        pink_grad.setColorAt(0.0, QColor(0, 0, 0, 0))                       # Center: Transparent
-        pink_grad.setColorAt(hole_fraction, pink0)                           # Start of Pink at full transparency
-        pink_grad.setColorAt(hole_fraction+blur_width, pink)                 # Max opaque pink at some distance
-        pink_grad.setColorAt(1.0, QColor(0, 0, 0, 0))                       # End at Pink at 100/255 transparency
+        pink_grad.setColorAt(0.0, QColor(0, 0, 0, 0))            # Center: Transparent
+        pink_grad.setColorAt(hole_fraction, pink0)               # Start of Pink at full transparency
+        pink_grad.setColorAt(hole_fraction+blur_width, pink)     # Max opaque pink at some distance
+        pink_grad.setColorAt(1.0, QColor(0, 0, 0, 0))            # End at Pink at 100/255 transparency
         self.rim_brush = pink_grad
 
         self.rim_radius = float(self.SPOT_RADIUS)
@@ -201,15 +200,26 @@ class GlobalState:
         else:
             self.mode_index = 0
             self.current_mode = "SPOTLIGHT_HOLD"
-        self.is_toggled_on = False
+        self.is_toggled_on = False # True only if SPOTLIGHT_TOGGLE mode is on
 
     def cycle_mode(self):
         if not self.config.MODES:
             return "SPOTLIGHT_HOLD"
+        # Reset toggle state on mode cycle
         self.is_toggled_on = False
         self.mode_index = (self.mode_index + 1) % len(self.config.MODES)
         self.current_mode = self.config.MODES[self.mode_index]
         return self.current_mode
+
+    # Helper method to check if an effect should be painted (kept for logic clarity)
+    def should_show_effect(self):
+        if self.current_mode == "SPOTLIGHT_TOGGLE":
+            return self.is_toggled_on
+        # SPOTLIGHT_HOLD and LASER are driven by hotkey press/release,
+        # but the request is for the overlay to always be shown, 
+        # so we rely on the internal `overlay_active` state in the widget
+        # which is toggled by the hotkeys.
+        return True
 
 global_state = GlobalState(global_config)
 
@@ -217,40 +227,44 @@ global_state = GlobalState(global_config)
 # Signals
 # -------------------------
 class KeyboardSignalEmitter(QObject):
-    overlay_activate = pyqtSignal()
-    overlay_deactivate = pyqtSignal()
+    # Signals now reflect controlling the 'effect' drawing, not the window's 'overlay'
+    effect_activate = pyqtSignal()
+    effect_deactivate = pyqtSignal()
     mode_changed = pyqtSignal(str)
+    screen_changed = pyqtSignal()
     app_quit = pyqtSignal()
 
 # -------------------------
 # PresenterOverlay
 # -------------------------
 class PresenterOverlay(QWidget):
+    _current_geometry = None
+    
     def __init__(self, initial_geometry: QRect, emitter: QObject, config: Config):
         super().__init__()
         self.config = config
+        self.emitter = emitter # Store emitter reference for screen check
 
         # --- internal state first ---
-        self.overlay_active = False
+        self.overlay_active = False 
         self.mouse_pos = QPoint(0, 0)
         self.laser_trail = []
-        # which mode flags (updated on activate)
+        # which mode flags (updated on mode change)
         self.is_spotlight_mode = False
         self.is_laser_mode = False
 
         # Timer: used for laser animation and also a lower-rate spotlight poll when needed.
-        self.update_delay = 10 # delay before accepting repaint to minimize chance of ghost
-        self.interval_laser = 30 # checking every xx ms for update for laser
-        self.interval_spotlight = 30 # 60 # checking every xx ms for update for spotlight
+        self.interval_laser = 30
+        self.interval_spotlight = 30 
 
         self.timer = QTimer(self)
         self.timer.setInterval(self.interval_laser)
         self.timer.timeout.connect(self._on_timer_tick)
-
-        # Create a single-shot timer for to minimize ghosting
-        self._update_timer = QTimer(self)
-        self._update_timer.setSingleShot(True)
-        self._update_timer.timeout.connect(self.update)
+        
+        # QTimer to check for screen changes (e.g., projector connected/disconnected)
+        self.screen_check_timer = QTimer(self)
+        self.screen_check_timer.setInterval(1000) # Check every 1 second
+        self.screen_check_timer.timeout.connect(self._check_screen_change)
         
         # Window flags: keep ToolTip plus TransparentForInput to be click-through
         self.setWindowFlags(
@@ -261,13 +275,17 @@ class PresenterOverlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
+        # Set initial geometry and store it
         self.setGeometry(initial_geometry)
+        PresenterOverlay._current_geometry = initial_geometry
 
         # connect signals
-        emitter.mode_changed.connect(self._on_mode_changed)
-
-        # show/hide once to ensure native window created, then hide
-        # set attribute to avoid activating the app when the overlay is shown
+        self.emitter.mode_changed.connect(self._on_mode_changed)
+        self.emitter.screen_changed.connect(self._on_screen_changed)
+        self.emitter.effect_activate.connect(self.activate_effect) 
+        self.emitter.effect_deactivate.connect(self.deactivate_effect) 
+        
+        # Initial setup: The overlay should be shown immediately and always
         try:
             # WA_ShowWithoutActivating prevents the window from stealing focus on macOS
             self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
@@ -277,100 +295,121 @@ class PresenterOverlay(QWidget):
                 self.setAttribute(Qt.WA_ShowWithoutActivating, True)
             except Exception:
                 pass
-    
+        
         self.show()
-        self.hide()
         self.raise_()
+        
+        # Start the screen check timer immediately
+        self.screen_check_timer.start()
 
         # macOS: make persistent overlay (will noop on linux)
         if IS_DARWIN:
             QTimer.singleShot(50, self.make_persistent_overlay)
 
-        # Enable mouse tracking *only* for internal events (won't break Linux even if no events)
-        # But we do NOT rely on mouseMoveEvent for cursor updates because overlay is click-through.
+        # Enable mouse tracking *only* for internal events
         self.setMouseTracking(True)
+        
+        # Initial mode setup to start the timer if needed
+        self._update_mode_flags()
+        self._update_timer_state()
+        
+    def _on_screen_changed(self):
+        print("Screen geometry changed. Adjusting overlay position.")
+        
+        # Preserve active state
+        was_active = self.overlay_active
+        
+        # Deactivate before changing geometry to clear state
+        self.deactivate_effect(is_mode_switch=True) 
+
+        geom = self._get_current_screen_geometry()
+        self.setGeometry(geom)
+        
+        # 4. Force an immediate repaint on the NEW geometry to ensure the window manager
+        # clears the new region's composition buffer.
+        self.update() 
+        
+        # 5. Restore active state if it was on, but with a small delay timer.
+        # This queues activate_effect() to run after the current screen geometry change
+        # and subsequent paint events are fully processed by the system.
+        if was_active:
+            QTimer.singleShot(150, self.activate_effect) # a delay is needed on macos
+                
+    def _check_screen_change(self):
+        new_geom = self._get_current_screen_geometry()
+        
+        # Compare current stored geometry with the new geometry
+        if new_geom != PresenterOverlay._current_geometry:
+            PresenterOverlay._current_geometry = new_geom
+            # Emit signal to handle the screen switch logic in the main thread
+            self.emitter.screen_changed.emit()
 
 
     # -----------------
     # mode handling
     # -----------------
     def _on_mode_changed(self, new_mode: str):
-        # on mode change deactivate overlay to reset state (matches your previous behaviour)
         print(f"MODE SWITCHED: {new_mode}")
-        self.deactivate_overlay()
+        
+        # Clear effect state/trail
+        self.deactivate_effect(is_mode_switch=True) 
+        self._update_mode_flags() # Update new flags
+        
+        self.update() # Repaint the whole window to force clear the composition mode
+        self._update_timer_state() # Start/stop timer based on new mode
 
     def _update_mode_flags(self):
         m = global_state.current_mode
         self.is_spotlight_mode = (m in ["SPOTLIGHT_HOLD", "SPOTLIGHT_TOGGLE"])
         self.is_laser_mode = (m == "LASER")
 
+    def _update_timer_state(self):
+        if self.is_laser_mode:
+            self.timer.setInterval(self.interval_laser)
+            if not self.timer.isActive():
+                self.timer.start()
+        elif self.is_spotlight_mode:
+            self.timer.setInterval(self.interval_spotlight)
+            if not self.timer.isActive():
+                self.timer.start()
+        else:
+            self.timer.stop()
+            
     # -----------------
-    # activation / deactivation
+    # activation / deactivation of the EFFECT
     # -----------------
-    def activate_overlay(self):
-        # update flags for current mode
-        self._update_mode_flags()
-
-        # set geometry to current screen
-        geom = self.get_current_screen_geometry()
-        self.setGeometry(geom)
-
-        # On macOS, record the current frontmost app so we can restore focus later
-        if IS_DARWIN:
-            try:
-                workspace = NSWorkspace.sharedWorkspace()
-                front = workspace.frontmostApplication()
-                # store a strong reference (NSRunningApplication)
-                self._previous_frontmost_app = front
-            except Exception:
-                self._previous_frontmost_app = None
-
+    def activate_effect(self):
         if not self.overlay_active:
             self.overlay_active = True
 
-            # Ensure we do not activate the app when showing the overlay
-            try:
-                self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-            except Exception:
+            # On macOS, record the current frontmost app
+            if IS_DARWIN:
                 try:
-                    self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+                    workspace = NSWorkspace.sharedWorkspace()
+                    front = workspace.frontmostApplication()
+                    self._previous_frontmost_app = front
                 except Exception:
-                    pass
+                    self._previous_frontmost_app = None
+                    
+            # Set the initial mouse position and force a repaint
+            self.mouse_pos = self.mapFromGlobal(QCursor.pos())
+            self.update() 
 
-            # show without stealing focus
-            self.show()
-            self.raise_()
-
-            # decide timer usage
-            if self.is_laser_mode:
-                # laser needs frequent updates for trail
-                self.timer.setInterval(self.interval_laser)
-                self.timer.start()
-            elif self.is_spotlight_mode:
-                # spotlight: poll at lower rate to avoid relying on mouseMoveEvent
-                self.timer.setInterval(self.interval_spotlight)
-                # start timer because overlay is click-through — reliable polling avoids misses
-                self.timer.start()
-            else:
-                self.timer.stop()
-
-    def deactivate_overlay(self):
+    def deactivate_effect(self, is_mode_switch=False):
         if self.overlay_active:
             self.overlay_active = False
-            self.timer.stop()
             self.laser_trail.clear()
-            self.hide()
-
-            # On macOS try to restore the previously frontmost app (if any)
-            if IS_DARWIN and getattr(self, "_previous_frontmost_app", None) is not None:
+            
+            # Force a repaint to draw the clear background (fully transparent)
+            self.update() 
+            
+            # Only try to restore focus on an actual deactivation, not a mode switch
+            if IS_DARWIN and not is_mode_switch and getattr(self, "_previous_frontmost_app", None) is not None:
                 try:
-                    # Reactivate the previous frontmost application.
-                    # Use a slight delay to avoid racing with window hide.
                     def _reactivate():
                         try:
                             self._previous_frontmost_app.activateWithOptions_(0)
                         except Exception:
-                            # fallback: try to activate by PID (best-effort)
                             try:
                                 pid = int(self._previous_frontmost_app.processIdentifier())
                                 app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
@@ -379,53 +418,46 @@ class PresenterOverlay(QWidget):
                             except Exception:
                                 pass
                         finally:
-                            # clear stored reference
                             self._previous_frontmost_app = None
 
                     QTimer.singleShot(30, _reactivate)
                 except Exception:
-                    # In case of any issue, just clear reference
                     self._previous_frontmost_app = None
 
     # -----------------
-    # timer tick: either advance laser or poll cursor for spotlight
+    # timer tick: update cursor position and handle laser trail decay
     # -----------------
     def _on_timer_tick(self):
-        if not self.overlay_active:
-            return
-
+        
         # 1. Get new position
         pos = QCursor.pos()
         local_pos = self.mapFromGlobal(pos)
         
-        # 2. Check for movement/update
+        needs_repaint = False
+        
         if local_pos == self.mouse_pos:
             # Only update for laser trail decay if mouse hasn't moved
-            if self.is_laser_mode:
-                # If trail is shrinking, we still need to repaint
-                if len(self.laser_trail) > 1:
-                    self.laser_trail.pop(0)
-                    self._update_timer.start(self.update_delay) # 10 ms delay (adjust as needed)
-
-                return
-            else:
-                return # No movement, no clear needed, no update
-
-        self.mouse_pos = local_pos
-        
-        # --- Handle LASER trail animation ---
-        if self.is_laser_mode:
-            self.laser_trail.append(QPointF(self.mouse_pos))
-            if len(self.laser_trail) > self.config.LASER_MAX_TRAIL_LENGTH:
+            if self.is_laser_mode and len(self.laser_trail) > 1:
                 self.laser_trail.pop(0)
+                needs_repaint = True
+        else:
+            self.mouse_pos = local_pos
+            needs_repaint = True
+            
+            # --- Handle LASER trail animation ---
+            if self.is_laser_mode and self.overlay_active:
+                self.laser_trail.append(QPointF(self.mouse_pos))
+                if len(self.laser_trail) > self.config.LASER_MAX_TRAIL_LENGTH:
+                    self.laser_trail.pop(0)
 
-        self._update_timer.start(self.update_delay) # 10 ms delay (adjust as needed)
+        if needs_repaint and self.overlay_active:
+            self.update()
 
 
     # -----------------
     # geometry helper
     # -----------------
-    def get_current_screen_geometry(self):
+    def _get_current_screen_geometry(self):
         cursor_pos = QCursor.pos()
         screen = QApplication.screenAt(cursor_pos)
         if screen is None:
@@ -433,67 +465,67 @@ class PresenterOverlay(QWidget):
         return screen.geometry()
 
     # -----------------
-    # paint event: only paints what's required
+    # paint event
     # -----------------
     def paintEvent(self, event):
-        if not self.overlay_active:
-            return
-
-        painter = QPainter(self)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing) # Add anti-aliasing for smoother edges
-
-        # Spotlight drawing
-        if self.is_spotlight_mode:
-            center = QPointF(self.mouse_pos)
-            
-            # 1. Draw dim background 
+        with QPainter(self) as painter:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing) 
+    
+            # Always clear the previous frame fully transparently
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            painter.fillRect(self.rect(), self.config.BACKGROUND_COLOR)
-        
-            # this check is needed to prevent ghosts on macos
-            prev_mouse_pos = getattr(self, 'prev_mouse_pos', None)
-            if prev_mouse_pos is None or not (prev_mouse_pos == self.mouse_pos):
-                self.prev_mouse_pos = self.mouse_pos
+            painter.fillRect(self.rect(), QColor(0,0,0,0)) 
+
+            if not self.overlay_active:
+                return
+
+            # Spotlight drawing
+            if self.is_spotlight_mode:
+                center = QPointF(self.mouse_pos)
+                
+                # 1. Draw dim background  
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+                painter.fillRect(self.rect(), self.config.BACKGROUND_COLOR)
+                
                 # 2. Cut transparent hole
                 painter.setBrush(self.config.hole_brush)
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut) # only changes alpha, not color!
-                painter.drawEllipse(center, 
-                                     self.config.hole_radius,
-                                     self.config.hole_radius)
-    
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut) 
+                painter.drawEllipse(center,  
+                                    self.config.hole_radius,
+                                    self.config.hole_radius)
+        
                 # 3. Draw rim around hole
                 self.config.rim_brush.setCenter(center)
                 self.config.rim_brush.setFocalPoint(center)
                 painter.setBrush(self.config.rim_brush)
                 painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
                 painter.drawEllipse(center,
-                                     self.config.rim_radius,
-                                     self.config.rim_radius)
-            return
-            
-        # Laser drawing
-        elif self.is_laser_mode:
-            if not self.laser_trail:
+                                    self.config.rim_radius,
+                                    self.config.rim_radius)
                 return
-            
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            total = len(self.laser_trail)
-            for i, pos in enumerate(self.laser_trail):
-                # compute alpha and radius
-                if total > 1:
-                    t = i / float(total - 1)
-                else:
-                    t = 1.0
-                alpha = int(self.config.LASER_MIN_ALPHA + (255 - self.config.LASER_MIN_ALPHA) * t)
-                radius = self.config.LASER_BASE_RADIUS
-                if i == total - 1:
-                    radius *= self.config.LASER_HEAD_MULTIPLIER
-                    alpha = 255
-                color = QColor(self.config.LASER_COLOR_BASE)
-                color.setAlpha(alpha)
-                painter.setBrush(QBrush(color))
-                painter.drawEllipse(pos, radius, radius)
+                
+            # Laser drawing
+            elif self.is_laser_mode:
+                if not self.laser_trail:
+                    return
+                
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+                total = len(self.laser_trail)
+                for i, pos in enumerate(self.laser_trail):
+                    # compute alpha and radius
+                    if total > 1:
+                        t = i / float(total - 1)
+                    else:
+                        t = 1.0
+                    alpha = int(self.config.LASER_MIN_ALPHA + (255 - self.config.LASER_MIN_ALPHA) * t)
+                    radius = self.config.LASER_BASE_RADIUS
+                    if i == total - 1:
+                        radius *= self.config.LASER_HEAD_MULTIPLIER
+                        alpha = 255
+                    color = QColor(self.config.LASER_COLOR_BASE)
+                    color.setAlpha(alpha)
+                    painter.setBrush(QBrush(color))
+                    painter.drawEllipse(pos, radius, radius)
 
     # macOS persistent overlay adjustments
     def make_persistent_overlay(self):
@@ -549,22 +581,21 @@ def start_overlay_hotkey_manager():
     def handle_mode_switch():
         new_mode = global_state.cycle_mode()
         emitter.mode_changed.emit(new_mode)
-        emitter.overlay_deactivate.emit()
 
     def handle_activate():
         if global_state.current_mode == "SPOTLIGHT_TOGGLE":
             if not global_state.is_toggled_on:
-                emitter.overlay_activate.emit()
+                emitter.effect_activate.emit()
                 global_state.is_toggled_on = True
             else:
-                emitter.overlay_deactivate.emit()
+                emitter.effect_deactivate.emit()
                 global_state.is_toggled_on = False
         elif global_state.current_mode in ["SPOTLIGHT_HOLD", "LASER"]:
-            emitter.overlay_activate.emit()
+            emitter.effect_activate.emit()
 
     def handle_deactivate():
         if global_state.current_mode in ["SPOTLIGHT_HOLD", "LASER"]:
-            emitter.overlay_deactivate.emit()
+            emitter.effect_deactivate.emit()
         return True
 
     def handle_quit():
@@ -591,30 +622,23 @@ def start_overlay_hotkey_manager():
 def main():
     app = QApplication(sys.argv)
 
-    def get_current_screen_geometry():
+    # Helper function to get initial geometry
+    def _get_current_screen_geometry():
         cursor_pos = QCursor.pos()
         screen = QApplication.screenAt(cursor_pos)
         if screen is None:
             return QApplication.primaryScreen().geometry()
         return screen.geometry()
 
-    initial_geometry = get_current_screen_geometry()
+    initial_geometry = _get_current_screen_geometry()
 
     global emitter
-    emitter = KeyboardSignalEmitter()
+    emitter = KeyboardSignalEmitter() 
 
+    # We rely on the overlay's internal logic and signals for updates
     overlay = PresenterOverlay(initial_geometry, emitter, global_config)
 
-    def handle_activate():
-        current_screen_geometry = get_current_screen_geometry()
-        overlay.setGeometry(current_screen_geometry)
-        overlay.activate_overlay()
-
-    def handle_deactivate():
-        overlay.deactivate_overlay()
-
-    emitter.overlay_activate.connect(handle_activate)
-    emitter.overlay_deactivate.connect(handle_deactivate)
+    # the overlay manages its own activation/deactivation/screen logic
     emitter.app_quit.connect(app.quit)
 
     hotkey_thread = threading.Thread(target=start_overlay_hotkey_manager, daemon=True)
@@ -624,6 +648,7 @@ def main():
     print(f"Norwii Action Keys: Ctrl+L (Press) / Ctrl+A (Release)")
     print(f"To exit cleanly, use the hotkey: Ctrl+Q")
     print("-" * 50)
+    print("Overlay is now always shown. Effect (Spotlight/Laser) is toggled by hotkeys.")
 
     try:
         sys.exit(app.exec())
